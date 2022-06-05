@@ -1,79 +1,89 @@
 package br.ufg.inf.media;
 
-import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.common.functions.GroupReduceFunction;
-import org.apache.flink.api.common.functions.MapFunction;
-import org.apache.flink.api.common.functions.ReduceFunction;
-import org.apache.flink.api.common.serialization.SimpleStringEncoder;
-import org.apache.flink.api.java.DataSet;
-import org.apache.flink.api.java.ExecutionEnvironment;
-import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.common.functions.*;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.java.tuple.Tuple3;
-import org.apache.flink.streaming.api.scala.DataStream;
-import org.apache.flink.table.api.EnvironmentSettings;
-import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.connectors.rabbitmq.RMQSink;
+import org.apache.flink.streaming.connectors.rabbitmq.RMQSource;
+import org.apache.flink.streaming.connectors.rabbitmq.common.RMQConnectionConfig;
 import org.apache.flink.util.Collector;
+
+import java.math.RoundingMode;
+import java.text.DecimalFormat;
 
 public class Media {
 
-    public static final String[] NUMS = new String[] {"10", "20", "30", "40", "50", "60"};
+    private static final DecimalFormat df = new DecimalFormat("0.00");
 
     public static void main(String[] args) throws Exception {
-        ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
 
-      //  DataSet<String> nums = env.fromElements(NUMS);
-       DataStream<String> nums = env.readTextFile("file:///home/beatriz/data.txt");
+        final ParameterTool params = ParameterTool.fromArgs(args);
 
-       // nums.map(new MapFunction()).groupBy(2).reduceGroup(new ReduceGroup()).reduce(new ReduceTuple()).map(new MapAvg()).print();
-        nums.map(new MapStrTuple()).groupBy(2).reduce(new ReduceTuple()).map(new MapAvg()).print();
+        // Setting up rabbitmq's configurations;
+        RMQConnectionConfig connectionConfig = new RMQConnectionConfig.Builder()
+                .setHost("localhost").setPort(5672).setUserName("admin")
+                .setPassword("admin").setVirtualHost("/").build();
+
+        // set up the execution environment
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        DataStream<String> nums = env.addSource(new RMQSource<String>(
+                        connectionConfig,            // config for the RabbitMQ connection
+                        "task_queue_input",                 // name of the RabbitMQ queue to consume
+                        true,                        // use correlation ids; can be false if only at-least-once is required
+                        new SimpleStringSchema()))   // deserialization schema to turn messages into Java objects
+                .setParallelism(1);
+
+        // make parameters available in the web interface
+        env.getConfig().setGlobalJobParameters(params);
+
+        DataStream<String> media = nums
+                .map(new MapStrTuple())
+                .keyBy(value -> value.f0)
+                .window(TumblingProcessingTimeWindows.of(Time.seconds(10)))
+                .reduce(new ReduceTuple()).map(new MapAvg());
+
+
+        media.addSink(new RMQSink<String>(
+                connectionConfig,            // config for the RabbitMQ connection
+                "task_queue_output",                 // name of the RabbitMQ queue to send messages to
+                new SimpleStringSchema()));
+
+        // execute program
+        env.executeAsync("media");
+
     }
 
-    private static class MapIntTuple implements MapFunction<Long, Tuple3<Long, Long, Long>> {
-        private long key = 2L;
+    private static class MapStrTuple implements MapFunction<String, Tuple3<String, Double, Long>> {
+
         @Override
-        public Tuple3<Long, Long, Long> map(Long n) throws Exception {
-            key = (key + 1L) % 3L;
-            return new Tuple3<Long, Long, Long>(n, 1L, key);
+        public Tuple3<String, Double, Long> map(String s) throws Exception {
+            String temp = s.substring(s.lastIndexOf(' ') + 1).trim();
+            Double temperatura = Double.parseDouble(temp);
+            String bairro = s.replaceAll(temp, "");
+            bairro = bairro.trim();
+            return new Tuple3<>(bairro,temperatura, 1L);
         }
     }
 
-    private static class MapStrTuple implements MapFunction<String, Tuple3<Long, Long, Long>> {
-        private long key = 2L;
+    private static class MapAvg implements MapFunction<Tuple3<String, Double, Long>, String> {
         @Override
-        public Tuple3<Long, Long, Long> map(String s) throws Exception {
-            key = (key + 1L) % 3L;
-            return new Tuple3<>(Long.parseLong(s), 1L, key);
+        public String map(Tuple3<String, Double, Long> t) throws Exception {
+            Double media = t.f1 / (double) t.f2;
+            String resultado = t.f0 + ';' + df.format(media);
+            return resultado;
         }
     }
 
-    private static class MapAvg implements MapFunction<Tuple3<Long, Long, Long>, Double> {
+    private static class ReduceTuple implements ReduceFunction<Tuple3<String, Double, Long>> {
         @Override
-        public Double map(Tuple3<Long, Long, Long> t) throws Exception {
-            return (double)t.f0 / (double)t.f1;
+        public Tuple3<String, Double, Long> reduce(Tuple3<String, Double, Long> v0, Tuple3<String, Double, Long> v1) throws Exception {
+            return new Tuple3<>(v0.f0, v0.f1 + v1.f1, v0.f2 + v1.f2);
         }
     }
-
-    private static class ReduceTuple implements ReduceFunction<Tuple3<Long, Long, Long>> {
-        @Override
-        public Tuple3<Long, Long, Long> reduce(Tuple3<Long, Long, Long> v0, Tuple3<Long, Long, Long> v1) throws Exception {
-            return new Tuple3<>(v0.f0+v1.f0, v0.f1+v1.f1, 0L);
-        }
-    }
-
-    private static class ReduceGroup implements GroupReduceFunction<Tuple3<Long, Long, Long>, Tuple3<Long, Long, Long>>{
-        @Override
-        public void reduce(Iterable<Tuple3<Long, Long, Long>> iter, Collector<Tuple3<Long, Long, Long>> out) throws Exception {
-            Tuple3<Long, Long, Long> resp = new Tuple3<>(0L, 0L, 0L);
-            for (Tuple3<Long, Long, Long> t : iter) {
-                resp.f0 = resp.f0 + t.f0;
-                resp.f1 = resp.f1 + t.f1;
-            }
-            out.collect(resp);
-        }
-    }
-    final EnvironmentSettings fsSettings = EnvironmentSettings.newInstance().useBlinkPlanner().inStreamingMode().build();
-  //  final StreamTableEnvironment fsTableEnv = StreamTableEnvironment.create(configuration, fsSettings);
-   // DataStream<String> finalRes = fsTableEnv.toAppendStream(tableNameHere, Media.class);
-
-
 }
